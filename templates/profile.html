@@ -693,7 +693,6 @@
 			}
 
 			const hoursMax = items.reduce((max, item) => Math.max(max, item.hours), 0);
-			const logMax = hoursMax > 0 ? Math.log1p(hoursMax) : 1;
 
 			const TARGET_CARD_WIDTH = 44;
 			const MAX_CARD_WIDTH = 240;
@@ -723,6 +722,15 @@
 			const weightExponent = 0.62;
 			const disparityCurve = 1.35;
 
+			// Pre-calculate weights as they don't change between iterations
+			const areaWeights = items.map((item) =>
+				Math.pow(Math.max(item.hours, 0) + weightBias, weightExponent),
+			);
+			const maxWeight = areaWeights.reduce(
+				(max, weight) => Math.max(max, weight),
+				0.0001,
+			);
+
 			for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
 				const columnWidth = stageWidth / columns;
 				const rowHeight = Math.max(columnWidth / HEADER_ASPECT, 10);
@@ -730,14 +738,6 @@
 				const maxSpan = clamp(computedMaxSpan, 4, Math.min(columns, 12));
 				const minSpan = 1;
 				const maxArea = maxSpan * maxSpan;
-
-				const areaWeights = items.map((item) =>
-					Math.pow(Math.max(item.hours, 0) + weightBias, weightExponent),
-				);
-				const maxWeight = areaWeights.reduce(
-					(max, weight) => Math.max(max, weight),
-					0.0001,
-				);
 
 				const cells = items.map((item, index) => {
 					const weight = areaWeights[index];
@@ -837,19 +837,15 @@
 			};
 		};
 
+		// Cache for playable games to avoid re-filtering/sorting on resize
+		let cachedPlayableGames = [];
+
 		const placeGames = () => {
 			if (!gamesContainer || !stageEl) {
 				return;
 			}
 
-			const playable = sourceGames
-				.filter(
-					(game) =>
-						typeof game?.appid === 'number' && getPrimaryMinutes(game) > 0,
-				)
-				.sort((a, b) => getPrimaryMinutes(b) - getPrimaryMinutes(a));
-
-			if (!playable.length) {
+			if (!cachedPlayableGames.length) {
 				gamesContainer.replaceChildren();
 				showError({
 					title: 'No playtime data available',
@@ -862,7 +858,7 @@
 
 			const { width: stageWidth, height: stageHeight } = getStageDimensions();
 
-			const items = playable.map((game) => ({
+			const items = cachedPlayableGames.map((game) => ({
 				id: game.appid,
 				hours: Math.max(getPrimaryMinutes(game), 0) / 60,
 			}));
@@ -876,7 +872,7 @@
 				return;
 			}
 
-			const gameById = new Map(playable.map((game) => [game.appid, game]));
+			const gameById = new Map(cachedPlayableGames.map((game) => [game.appid, game]));
 			const fragment = document.createDocumentFragment();
 
 			for (const cell of layout.cells) {
@@ -939,6 +935,15 @@
 				});
 				return;
 			}
+
+			// Filter and sort once when data is received
+			cachedPlayableGames = sourceGames
+				.filter(
+					(game) =>
+						typeof game?.appid === 'number' && getPrimaryMinutes(game) > 0,
+				)
+				.sort((a, b) => getPrimaryMinutes(b) - getPrimaryMinutes(a));
+
 			placeGames();
 		};
 
