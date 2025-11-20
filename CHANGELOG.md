@@ -1,3 +1,15 @@
+## [1.21.1](https://github.com/obviyus/playtime-panorama/compare/v1.21.0...v1.21.1) (2025-11-20)
+
+
+### Bug Fixes
+
+* simplify compact number formatting using `Intl.NumberFormat`. ([b2c6605](https://github.com/obviyus/playtime-panorama/commit/b2c6605a5cbbdfea88cbb78a529856ccf45fe694))
+
+
+### Performance Improvements
+
+* pre-calculate game area weights ([ae21d7f](https://github.com/obviyus/playtime-panorama/commit/ae21d7f517d574482005c36598490c35100d444c))
+
 # [1.21.0](https://github.com/obviyus/playtime-panorama/compare/v1.20.0...v1.21.0) (2025-11-03)
 
 
