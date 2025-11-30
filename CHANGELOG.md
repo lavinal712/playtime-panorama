@@ -1,3 +1,10 @@
+## [1.21.2](https://github.com/obviyus/playtime-panorama/compare/v1.21.1...v1.21.2) (2025-11-30)
+
+
+### Performance Improvements
+
+* optimize profile.html resize and export performance ([70a2d28](https://github.com/obviyus/playtime-panorama/commit/70a2d28aadfbbb9468481ca7bf435807ac660199))
+
 ## [1.21.1](https://github.com/obviyus/playtime-panorama/compare/v1.21.0...v1.21.1) (2025-11-20)
 
 
