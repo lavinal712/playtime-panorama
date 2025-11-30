@@ -545,12 +545,37 @@
 				throw new Error('No games were found to export.');
 			}
 
+			// AIDEV-NOTE: Batch all getBoundingClientRect calls BEFORE any async work
+			// This avoids forced synchronous layout recalcs interleaved with awaits
 			const containerRect = gamesContainer.getBoundingClientRect();
+			const containerLeft = containerRect.left;
+			const containerTop = containerRect.top;
 			const width = Math.round(containerRect.width);
 			const height = Math.round(containerRect.height);
 
 			if (width <= 0 || height <= 0) {
 				throw new Error('The mosaic is not ready to export.');
+			}
+
+			// Batch-read all card rects and images in one synchronous pass
+			const cardData = [];
+			for (let i = 0; i < cards.length; i++) {
+				const card = cards[i];
+				const img = card.querySelector('img');
+				if (!img || (!img.currentSrc && !img.src)) {
+					continue;
+				}
+				const rect = card.getBoundingClientRect();
+				if (rect.width <= 0 || rect.height <= 0) {
+					continue;
+				}
+				cardData.push({
+					img,
+					left: rect.left - containerLeft,
+					top: rect.top - containerTop,
+					width: rect.width,
+					height: rect.height,
+				});
 			}
 
 			const pixelRatio = window.devicePixelRatio || 1;
@@ -577,21 +602,10 @@
 			context.fillStyle = '#05060f';
 			context.fillRect(0, 0, canvasWidth, canvasHeight);
 
+			// Now do async work with pre-collected measurements
 			let drawnTiles = 0;
-			for (const card of cards) {
-				const img = card.querySelector('img');
-				if (!img || (!img.currentSrc && !img.src)) {
-					continue;
-				}
-				const rect = card.getBoundingClientRect();
-				const drawWidth = rect.width;
-				const drawHeight = rect.height;
-				if (drawWidth <= 0 || drawHeight <= 0) {
-					continue;
-				}
-
-				const left = rect.left - containerRect.left;
-				const top = rect.top - containerRect.top;
+			for (let i = 0; i < cardData.length; i++) {
+				const { img, left, top, width: drawWidth, height: drawHeight } = cardData[i];
 				let drawable;
 				try {
 					drawable = await getDrawableAsset(img);
@@ -683,8 +697,28 @@
 
 		const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
+		// AIDEV-NOTE: Pre-allocated buffers for computeGridLayout to avoid GC pressure on resize
+		// These grow as needed but never shrink - avoids repeated allocations
+		let areaWeightsBuffer = null;
+		let cellsBuffer = [];
+		let cellsBufferSize = 0;
+
+		const ensureBuffers = (size) => {
+			if (!areaWeightsBuffer || areaWeightsBuffer.length < size) {
+				// Allocate with headroom to avoid frequent resizing
+				const newSize = Math.max(size, 256) * 2;
+				areaWeightsBuffer = new Float64Array(newSize);
+				cellsBuffer = new Array(newSize);
+				for (let i = 0; i < newSize; i++) {
+					cellsBuffer[i] = { id: 0, span: 1, order: 0, areaRatio: 0 };
+				}
+			}
+			cellsBufferSize = size;
+		};
+
 		const computeGridLayout = (items, stageWidth, stageHeight) => {
-			if (!items.length || stageWidth <= 0) {
+			const itemCount = items.length;
+			if (!itemCount || stageWidth <= 0) {
 				return {
 					columns: 1,
 					rowHeight: 0,
@@ -692,7 +726,7 @@
 				};
 			}
 
-			const hoursMax = items.reduce((max, item) => Math.max(max, item.hours), 0);
+			ensureBuffers(itemCount);
 
 			const TARGET_CARD_WIDTH = 44;
 			const MAX_CARD_WIDTH = 240;
@@ -700,7 +734,7 @@
 				4,
 				Math.ceil(stageWidth / MAX_CARD_WIDTH),
 			);
-			const maxColumnsBound = Math.max(minColumnsBound, Math.min(72, items.length));
+			const maxColumnsBound = Math.max(minColumnsBound, Math.min(72, itemCount));
 			const stageBaseHeight =
 				stageHeight && stageHeight > 0 ? stageHeight : (window.innerHeight || 0);
 			const maxHeight = Math.max(stageBaseHeight || 0, 480);
@@ -715,21 +749,26 @@
 				maxColumnsBound,
 			);
 
-			let layout = { columns, rowHeight: 0, cells: [] };
-			let bestLayout = null;
+			let layoutColumns = columns;
+			let layoutRowHeight = 0;
+			let layoutCellsLength = 0;
+			let bestLayoutColumns = 0;
+			let bestLayoutRowHeight = 0;
+			let bestLayoutCellsLength = 0;
+			let hasBestLayout = false;
+
 			const MAX_ITERATIONS = 8;
 			const weightBias = 0.1;
 			const weightExponent = 0.62;
 			const disparityCurve = 1.35;
 
-			// Pre-calculate weights as they don't change between iterations
-			const areaWeights = items.map((item) =>
-				Math.pow(Math.max(item.hours, 0) + weightBias, weightExponent),
-			);
-			const maxWeight = areaWeights.reduce(
-				(max, weight) => Math.max(max, weight),
-				0.0001,
-			);
+			// Pre-calculate weights into buffer (no allocation)
+			let maxWeight = 0.0001;
+			for (let i = 0; i < itemCount; i++) {
+				const w = Math.pow(Math.max(items[i].hours, 0) + weightBias, weightExponent);
+				areaWeightsBuffer[i] = w;
+				if (w > maxWeight) maxWeight = w;
+			}
 
 			for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
 				const columnWidth = stageWidth / columns;
@@ -739,34 +778,46 @@
 				const minSpan = 1;
 				const maxArea = maxSpan * maxSpan;
 
-				const cells = items.map((item, index) => {
-					const weight = areaWeights[index];
+				// Write directly into pre-allocated cells buffer (no allocation)
+				let totalArea = 0;
+				for (let i = 0; i < itemCount; i++) {
+					const weight = areaWeightsBuffer[i];
 					const ratio = Math.max(0, weight / maxWeight);
 					const adjusted = Math.pow(ratio, disparityCurve);
 					const targetArea = 1 + adjusted * (maxArea - 1);
 					const span = clamp(Math.round(Math.sqrt(targetArea)), minSpan, maxSpan);
-					return { id: item.id, span, order: index, areaRatio: ratio };
-				});
 
-				if (cells.length && maxSpan > 1) {
-					cells[0].span = Math.max(cells[0].span, maxSpan);
-					for (let i = 1; i < Math.min(3, cells.length); i++) {
-						const cell = cells[i];
+					const cell = cellsBuffer[i];
+					cell.id = items[i].id;
+					cell.span = span;
+					cell.order = i;
+					cell.areaRatio = ratio;
+					totalArea += span * span;
+				}
+
+				// Boost top games
+				if (itemCount && maxSpan > 1) {
+					const oldSpan0 = cellsBuffer[0].span;
+					cellsBuffer[0].span = Math.max(cellsBuffer[0].span, maxSpan);
+					totalArea += cellsBuffer[0].span * cellsBuffer[0].span - oldSpan0 * oldSpan0;
+
+					for (let i = 1; i < Math.min(3, itemCount); i++) {
+						const cell = cellsBuffer[i];
 						if (cell.areaRatio >= 0.5) {
+							const oldSpan = cell.span;
 							const target = Math.round(
 								minSpan + cell.areaRatio * (maxSpan - minSpan),
 							);
 							cell.span = clamp(target, cell.span, maxSpan - i);
+							totalArea += cell.span * cell.span - oldSpan * oldSpan;
 						}
 					}
 				}
 
-				const totalArea = cells.reduce((acc, cell) => acc + cell.span * cell.span, 0);
 				const approxHeight =
 					(totalArea * stageWidth) / (columns * columns * HEADER_ASPECT);
 
 				const maxColumnsAllowed = maxColumnsBound;
-				const candidateLayout = { columns, rowHeight, cells };
 
 				if (approxHeight > maxHeight * 1.02 && columns < maxColumnsAllowed) {
 					const requiredColumns = clamp(
@@ -780,7 +831,10 @@
 					);
 
 					if (requiredColumns !== columns) {
-						bestLayout = candidateLayout;
+						bestLayoutColumns = columns;
+						bestLayoutRowHeight = rowHeight;
+						bestLayoutCellsLength = itemCount;
+						hasBestLayout = true;
 						columns = requiredColumns;
 						continue;
 					}
@@ -801,35 +855,64 @@
 						columns - 1,
 					);
 					if (desiredColumns !== columns) {
-						bestLayout = candidateLayout;
+						bestLayoutColumns = columns;
+						bestLayoutRowHeight = rowHeight;
+						bestLayoutCellsLength = itemCount;
+						hasBestLayout = true;
 						columns = desiredColumns;
 						continue;
 					}
 				}
 
-				layout = candidateLayout;
+				layoutColumns = columns;
+				layoutRowHeight = rowHeight;
+				layoutCellsLength = itemCount;
 				break;
 			}
 
-			if ((!layout.cells.length || layout.rowHeight <= 0) && bestLayout) {
-				layout = bestLayout;
+			if (layoutCellsLength === 0 && hasBestLayout) {
+				layoutColumns = bestLayoutColumns;
+				layoutRowHeight = bestLayoutRowHeight;
+				layoutCellsLength = bestLayoutCellsLength;
 			}
 
-			return layout;
+			// Return a view of the buffer (shallow copy cell refs to avoid mutation issues)
+			const cells = new Array(layoutCellsLength);
+			for (let i = 0; i < layoutCellsLength; i++) {
+				const src = cellsBuffer[i];
+				cells[i] = { id: src.id, span: src.span, order: src.order, areaRatio: src.areaRatio };
+			}
+
+			return {
+				columns: layoutColumns,
+				rowHeight: layoutRowHeight,
+				cells,
+			};
 		};
+
+		// Cache padding values - they don't change during session
+		let cachedPaddingX = -1;
+		let cachedPaddingY = -1;
+		// Cache last dimensions to skip redundant layout computation
+		let lastStageWidth = 0;
+		let lastStageHeight = 0;
 
 		const getStageDimensions = () => {
 			const rect = stageEl?.getBoundingClientRect();
-			const style = stageEl ? window.getComputedStyle(stageEl) : null;
-			const paddingX = style
-				? parseFloat(style.paddingLeft || '0') + parseFloat(style.paddingRight || '0')
-				: 0;
-			const paddingY = style
-				? parseFloat(style.paddingTop || '0') + parseFloat(style.paddingBottom || '0')
-				: 0;
 
-			const innerWidth = Math.max((rect?.width || window.innerWidth || 0) - paddingX, 1);
-			const innerHeight = Math.max((rect?.height || window.innerHeight || 0) - paddingY, 1);
+			// Cache padding on first call (avoids getComputedStyle on every resize)
+			if (cachedPaddingX < 0) {
+				const style = stageEl ? window.getComputedStyle(stageEl) : null;
+				cachedPaddingX = style
+					? parseFloat(style.paddingLeft || '0') + parseFloat(style.paddingRight || '0')
+					: 0;
+				cachedPaddingY = style
+					? parseFloat(style.paddingTop || '0') + parseFloat(style.paddingBottom || '0')
+					: 0;
+			}
+
+			const innerWidth = Math.max((rect?.width || window.innerWidth || 0) - cachedPaddingX, 1);
+			const innerHeight = Math.max((rect?.height || window.innerHeight || 0) - cachedPaddingY, 1);
 
 			return {
 				width: Math.floor(innerWidth),
@@ -839,8 +922,28 @@
 
 		// Cache for playable games to avoid re-filtering/sorting on resize
 		let cachedPlayableGames = [];
+		// Pre-computed layout items (id + hours) - avoids recomputation on resize
+		let cachedLayoutItems = [];
+		// Track current layout to detect if spans actually changed
+		let currentLayoutColumns = 0;
+		let currentLayoutRowHeight = 0;
+		// Pre-computed span strings to avoid template literal allocation in loops
+		const SPAN_STYLES = Array.from({ length: 25 }, (_, i) => `span ${i}`);
 
-		const placeGames = () => {
+		// AIDEV-NOTE: Hot path optimization - updateLayout only touches styles, no DOM rebuild
+		const updateLayout = (layout) => {
+			const existingCards = gamesContainer.children;
+			for (let i = 0; i < layout.cells.length; i++) {
+				const card = existingCards[i];
+				const cell = layout.cells[i];
+				card.style.gridColumn = SPAN_STYLES[cell.span];
+				card.style.gridRow = SPAN_STYLES[cell.span];
+			}
+			gamesContainer.style.setProperty('--columns', String(layout.columns));
+			gamesContainer.style.setProperty('--row-size', px(layout.rowHeight));
+		};
+
+		const placeGames = (forceRebuild = false) => {
 			if (!gamesContainer || !stageEl) {
 				return;
 			}
@@ -858,12 +961,21 @@
 
 			const { width: stageWidth, height: stageHeight } = getStageDimensions();
 
-			const items = cachedPlayableGames.map((game) => ({
-				id: game.appid,
-				hours: Math.max(getPrimaryMinutes(game), 0) / 60,
-			}));
+			// Ultra-fast path: if dimensions unchanged and DOM exists, skip entirely
+			const existingCards = gamesContainer.children;
+			if (
+				!forceRebuild &&
+				stageWidth === lastStageWidth &&
+				stageHeight === lastStageHeight &&
+				existingCards.length === cachedPlayableGames.length
+			) {
+				return;
+			}
 
-			const layout = computeGridLayout(items, stageWidth, stageHeight);
+			lastStageWidth = stageWidth;
+			lastStageHeight = stageHeight;
+
+			const layout = computeGridLayout(cachedLayoutItems, stageWidth, stageHeight);
 
 			if (!layout.cells.length || layout.rowHeight <= 0) {
 				statusEl?.classList.add('error');
@@ -872,23 +984,29 @@
 				return;
 			}
 
-			const gameById = new Map(cachedPlayableGames.map((game) => [game.appid, game]));
+			// Fast path: if DOM already has correct cards, just update spans
+			if (existingCards.length === layout.cells.length && cachedPlayableGames.length === existingCards.length) {
+				updateLayout(layout);
+				currentLayoutColumns = layout.columns;
+				currentLayoutRowHeight = layout.rowHeight;
+				return;
+			}
+
+			// Slow path: full DOM rebuild (only on initial load or game count change)
 			const fragment = document.createDocumentFragment();
 
-			for (const cell of layout.cells) {
-				const game = gameById.get(cell.id);
+			for (let i = 0; i < layout.cells.length; i++) {
+				const cell = layout.cells[i];
+				const game = cachedPlayableGames[cell.order];
 				if (!game) {
 					continue;
 				}
 
 				const card = document.createElement('article');
 				card.className = 'game-card';
-				card.style.gridColumn = `span ${cell.span}`;
-				card.style.gridRow = `span ${cell.span}`;
-				const hours = Math.max(getPrimaryMinutes(game), 0) / 60;
-				card.dataset.hours = `${hours.toLocaleString(undefined, {
-					maximumFractionDigits: hours < 10 ? 1 : 0,
-				})} hrs`;
+				card.style.gridColumn = SPAN_STYLES[cell.span];
+				card.style.gridRow = SPAN_STYLES[cell.span];
+				card.dataset.hours = game._hoursFormatted;
 
 				const img = document.createElement('img');
 				img.loading = 'eager';
@@ -904,6 +1022,8 @@
 			gamesContainer.style.setProperty('--columns', String(layout.columns));
 			gamesContainer.style.setProperty('--row-size', px(layout.rowHeight));
 			gamesContainer.replaceChildren(fragment);
+			currentLayoutColumns = layout.columns;
+			currentLayoutRowHeight = layout.rowHeight;
 			statusEl?.classList.remove('error');
 			statusEl?.classList.remove('has-message');
 			statusEl?.classList.add('hidden');
@@ -923,6 +1043,16 @@
 			setDownloadState('disabled');
 		};
 
+		// Fast hours formatter - avoids toLocaleString overhead in hot path
+		const formatHoursDisplay = (hours) => {
+			if (hours < 10) {
+				const whole = hours | 0;
+				const frac = ((hours * 10) | 0) % 10;
+				return `${whole}.${frac} hrs`;
+			}
+			return `${Math.round(hours)} hrs`;
+		};
+
 		const renderGames = (games) => {
 			sourceGames = Array.isArray(games) ? games : [];
 			if (!sourceGames.length) {
@@ -936,15 +1066,33 @@
 				return;
 			}
 
-			// Filter and sort once when data is received
+			// Filter, enrich with pre-computed values, and sort ONCE when data is received
+			// AIDEV-NOTE: Pre-computing _hours and _hoursFormatted avoids repeated work on resize
 			cachedPlayableGames = sourceGames
 				.filter(
 					(game) =>
-						typeof game?.appid === 'number' && getPrimaryMinutes(game) > 0,
+						typeof game?.appid === 'number' && (game.playtime_forever ?? 0) > 0,
 				)
-				.sort((a, b) => getPrimaryMinutes(b) - getPrimaryMinutes(a));
+				.map((game) => {
+					const hours = Math.max(game.playtime_forever ?? 0, 0) / 60;
+					return {
+						...game,
+						_hours: hours,
+						_hoursFormatted: formatHoursDisplay(hours),
+					};
+				})
+				.sort((a, b) => b._hours - a._hours);
 
-			placeGames();
+			// Pre-build layout items array (used by computeGridLayout)
+			cachedLayoutItems = cachedPlayableGames.map((game) => ({
+				id: game.appid,
+				hours: game._hours,
+			}));
+
+			// Reset dimension cache to force full layout on new data
+			lastStageWidth = 0;
+			lastStageHeight = 0;
+			placeGames(true);
 		};
 
 		window.addEventListener('resize', () => {
