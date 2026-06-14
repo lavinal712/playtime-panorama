@@ -11,6 +11,8 @@ import rootBundle from "~/templates/root.html";
 
 const DEFAULT_PORT = Number(Bun.env.PORT ?? Bun.env.BUN_PORT ?? 3000);
 const developmentMode = Bun.env.NODE_ENV !== "production";
+const STEAM_APP_DETAILS_BASE = "https://store.steampowered.com/api/appdetails";
+const appImageCache = new Map<number, string>();
 
 if (!Bun.env.STEAM_API_KEY) {
 	console.warn("Missing STEAM_API_KEY. /api/playtime requests will fail.");
@@ -84,6 +86,36 @@ async function createPlaytimeResponse(
 	}
 }
 
+async function createAppImageResponse(appIdParam: string | undefined) {
+	const appId = Number(appIdParam);
+	if (!Number.isInteger(appId) || appId <= 0) {
+		return Response.json({ error: "Invalid Steam appid." }, { status: 400 });
+	}
+
+	const cached = appImageCache.get(appId);
+	if (cached) {
+		return Response.redirect(cached, 302);
+	}
+
+	const requestUrl = `${STEAM_APP_DETAILS_BASE}?${new URLSearchParams({
+		appids: String(appId),
+		filters: "basic",
+	})}`;
+	const response = await fetch(requestUrl);
+	if (!response.ok) {
+		return Response.json({ error: "Unable to load Steam app details." }, { status: 502 });
+	}
+
+	const payload = await response.json();
+	const imageUrl = payload?.[String(appId)]?.data?.header_image;
+	if (typeof imageUrl !== "string" || !imageUrl.startsWith("https://")) {
+		return Response.json({ error: "No Steam header image found." }, { status: 404 });
+	}
+
+	appImageCache.set(appId, imageUrl);
+	return Response.redirect(imageUrl, 302);
+}
+
 
 const server = Bun.serve({
 	port: DEFAULT_PORT,
@@ -105,6 +137,9 @@ const server = Bun.serve({
 					apiKey
 				);
 			},
+		},
+		"/api/app-image/:appid": {
+			GET: async (req) => createAppImageResponse(req.params.appid),
 		},
 		"/leaderboard": leaderboardBundle,
 		"/api/leaderboard": {

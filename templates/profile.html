@@ -361,6 +361,7 @@
 	</main>
 	<script type="module">
 		const STEAM_CDN_BASE = "https://cdn.steamstatic.com/steam/apps";
+		const STEAM_APP_IMAGE_FALLBACK_BASE = "/api/app-image";
 
 		const STEAM_ID64_PATTERN = /^\d{17}$/;
 
@@ -1012,8 +1013,11 @@
 				img.loading = 'eager';
 				img.decoding = 'async';
 				img.crossOrigin = 'anonymous';
-				img.src = `${STEAM_CDN_BASE}/${game.appid}/header.jpg`;
 				img.alt = game.name ?? `App ${game.appid}`;
+				img.addEventListener('error', () => {
+					img.src = `${STEAM_APP_IMAGE_FALLBACK_BASE}/${encodeURIComponent(String(game.appid))}`;
+				}, { once: true });
+				img.src = `${STEAM_CDN_BASE}/${game.appid}/header.jpg`;
 
 				card.append(img);
 				fragment.append(card);
